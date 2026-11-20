@@ -1,122 +1,95 @@
-from stv import all_rankings, missing_ballot_analysis
-
-import csv
-import multiprocessing as mp
-from collections import Counter
-from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
-@lru_cache(maxsize=None)
-def _inversions(m) -> np.ndarray[np.int64]:
-    """Distance of each ranking from the reference 0, 1,..., m-1"""
-    R = all_rankings(m)
-    inv = np.zeros(len(R), dtype=np.int64)
-    for i in range(m):
-        for j in range(i + 1, m):
-            inv += R[:, i] > R[:, j]
-    return inv
+from stv import allbutone_analysis
+from basic_experiments import mallows_election, _make_seed
 
-def mallows_ballot(m, phi, rng):
-    """returns the ranking of one mallows(phi) ballot"""
-    ranking = []
-    for i in range(m):
-        w = phi ** (i - np.arange(i + 1))
-        ranking.insert(int(rng.choice(i + 1, p=w / w.sum())), i)
-    return tuple(ranking)
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
-def mallows_election(n, m, phi, rng):
-    return Counter(mallows_ballot(m, phi, rng) for _ in range(n))
 
-def mallows_dist(m, phi) -> np.ndarray[np.float64]:
-    """Gives array of probability weights for each ranking"""
-    w = phi ** _inversions(m).astype(float)
-    return w / w.sum()
+def _summarize(elections):
+    return (elections.groupby(["m", "k", "n", "phi"])
+            .agg(n_roots=("root", "count"),
+                 mean_p_wrong=("p_wrong", "mean"),
+                 se_p_wrong=("p_wrong",
+                             lambda x: x.std(ddof=1) / np.sqrt(len(x))),
+                 mean_e_replaced=("e_replaced", "mean"),
+                 frac_adv_flip=("adv_flip", "mean"),
+                 mean_max_replaced=("max_replaced", "mean"),
+                 frac_roots_p_wrong_pos=("p_wrong",
+                                         lambda x: (x > 0).mean()),
+                 mean_n_types=("n_types", "mean"))
+            .reset_index())
 
-def _bits(mask, m):
-    return "-".join(str(c) for c in range(m) if mask >> c & 1)
 
-def _make_seed(seed, k, phi, n, trial):
-    ss = np.random.SeedSequence([seed, k, int(round(phi * 1e6)), n, trial])
-    return int(ss.generate_state(1)[0])
+def _save(elections, summary, results_dir):
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    elections.to_csv(results_dir / "allbutone_elections.csv", index=False)
+    summary.to_csv(results_dir / "allbutone_summary.csv", index=False)
+    return results_dir
 
-def _one_trial(args):
-    """Simulates one election with one missing ballot from an rng seed"""
-    culture, m, k, par, n, seed, trial = args
-    rng = np.random.default_rng(seed)
-    obs = mallows_election(n - 1, m, par, rng)
-    dist = mallows_dist(m, par)
-    r = missing_ballot_analysis(obs, m, k, dist)
 
-    # test one scenario by drawing one random ballot from the culture and 
-    # running stv
-    i = int(rng.choice(len(dist), p=dist))
-    sampled = tuple(int(x) for x in all_rankings(m)[i])
-    full_mask = int(r["win_masks"][i])
-    pred_mask = sum(1 << c for c in r["predicted"])
-    top = r["flipping"][0] if r["flipping"] else None
-    return {
-        "culture": culture, "m": m, "k": k, "param": par, "n": n,
-        "trial": trial, "seed": seed,
-        "n_unique_observed": len(obs),
-        "predicted_winners": _bits(pred_mask, m),
-        "sampled_missing_ballot": "-".join(map(str, sampled)),
-        "winners_with_sampled_ballot": _bits(full_mask, m),
-        "prediction_correct": full_mask == pred_mask,
-        "p_wrong_exact": r["p_wrong"],
-        "e_replaced": r["e_replaced"],
-        "adv_flip_possible": r["adv_flip"],
-        "max_replaced": r["max_replaced"],
-        "n_flipping_rankings": len(r["flipping"]),
-        "top_flipping_ranking": "-".join(map(str, top[0])) if top else "",
-        "top_flipping_prob": top[1] if top else "",
-    }
-
-def run_experiment(culture="mallows", m=6, ks=(2, 3, 4),
-                   params=(0.5, 0.8, 1.0), ns=(51, 201), trials=50,
-                   seed=0, n_jobs=1, out_prefix="results"):
+def run_allbutn_experiment(m, k, ns, phis, n_roots=500, seed=0, paired=True,
+                           save=True, results_dir=RESULTS_DIR, verbose=True):
     """
-    Runs multiple trials for each combination of parameters to be tested
-    Returns results as csv!
+    All-but-one experiment on Mallows root elections for one (m, k).
+
+    paired : if True, the rng seed ignores phi, so root r at size n uses the
+             same uniforms at every phi (phi comparisons are paired).
+    save   : write the two CSVs (allbutone_elections / allbutone_summary).
     """
-    # parameter tuples are arbitrary and should be edited to test different values
-    elections, summary = [], []
-    pool = mp.Pool(None if n_jobs == -1 else n_jobs) if n_jobs != 1 else None
-    try:
-        for k in ks:
-            for par in params:
-                for n in ns:
-                    jobs = [(culture, m, k, par, n,
-                             _make_seed(seed, k, par, n, t), t)
-                            for t in range(trials)]
-                    rows = (pool.map(_one_trial, jobs) if pool
-                            else [_one_trial(j) for j in jobs])
-                    elections.extend(rows)
-                    cell = {
-                        "culture": culture, "m": m, "k": k, "param": par,
-                        "n": n, "trials": trials,
-                        "mean_p_wrong": np.mean([x["p_wrong_exact"] for x in rows]),
-                        "mean_e_replaced": np.mean([x["e_replaced"] for x in rows]),
-                        "frac_adv_flip_possible": np.mean([x["adv_flip_possible"] for x in rows]),
-                        "frac_sampled_wrong": np.mean([not x["prediction_correct"] for x in rows]),
-                        "mean_max_replaced": np.mean([x["max_replaced"] for x in rows]),
-                    }
-                    summary.append(cell)
-                    print(f"{k:>2} {par:>6} {n:>6} {cell['mean_p_wrong']:>9.4f} "
-                          f"{cell['mean_e_replaced']:>9.4f} "
-                          f"{cell['frac_adv_flip_possible']:>12.3f} "
-                          f"{cell['frac_sampled_wrong']:>19.3f}")
-    finally:
-        if pool:
-            pool.close()
-    for name, rows in (("elections", elections), ("summary", summary)):
-        path = f"{out_prefix}_{name}.csv"
-        with open(path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            w.writeheader()
-            w.writerows(rows)
-        print(f"wrote {path} ({len(rows)} rows)")
+    ns = [ns] if np.isscalar(ns) else list(ns)
+    phis = [phis] if np.isscalar(phis) else list(phis)
+    rows = []
+    for n in ns:
+        for r in range(n_roots):
+            for phi in phis:
+                s = _make_seed(seed, m, k, 0.0 if paired else phi, n, r)
+                profile = mallows_election(n, m, phi, np.random.default_rng(s))
+                res = allbutone_analysis(profile, m, k)
+                rows.append({"m": m, "k": k, "n": n, "phi": phi, "root": r,
+                             "winners": "-".join(map(str, res["winners"])),
+                             "n_types": res["n_types"],
+                             "p_wrong": res["p_wrong"],
+                             "e_replaced": res["e_replaced"],
+                             "adv_flip": res["adv_flip"],
+                             "max_replaced": res["max_replaced"],
+                             "n_flip_types": res["n_flip_types"]})
+        if verbose:
+            print(f"  m={m} k={k} n={n} done")
+    elections = pd.DataFrame(rows)
+    summary = _summarize(elections)
+    if save:
+        d = _save(elections, summary, results_dir)
+        if verbose:
+            print(f"saved to {d}")
+    return elections, summary
+
+
+def run_allbutn_sweep(ms=range(3, 9), ns=(50, 100),
+                      phis=(0.2, 0.4, 0.6, 0.8, 1.0), n_roots=200, seed=0,
+                      paired=True, results_dir=RESULTS_DIR):
+    """
+    Runs run_allbutn_experiment for every m in ms and every k in 2..m-1,
+    then saves ONE combined allbutone_elections.csv / allbutone_summary.csv.
+    """
+    parts = []
+    for m in ms:
+        for k in range(2, m):
+            print(f"m={m}, k={k}")
+            el, _ = run_allbutn_experiment(m, k, ns, phis, n_roots=n_roots,
+                                           seed=seed, paired=paired,
+                                           save=False, verbose=False)
+            parts.append(el)
+    elections = pd.concat(parts, ignore_index=True)
+    summary = _summarize(elections)
+    d = _save(elections, summary, results_dir)
+    print(f"saved to {d}")
     return elections, summary
 
 if __name__ == "__main__":
-    run_experiment(n_jobs=-1)
+    elections, summary = run_allbutn_sweep(n_roots=200)
+    print(summary.to_string(index=False))

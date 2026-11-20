@@ -70,10 +70,13 @@ def stv(B, w, m, k):
 _POPCOUNT = np.array([bin(i).count("1") for i in range(1 << 8)])
 
 
-def missing_ballot_analysis(observed, m, k, dist):
+def full_analysis(observed, m, k, dist):
     """
     Returns different metrics (explained at top of module) for the missing
-    ballot election
+    ballot election.
+
+    Measures empirics scaled to statistical culture AND gives some worst case 
+    analysis (testing every possible ranking contained in the missing ballot)
     """
     # observed & predicted: election w/ n - 1 ballots & its winners
     B, w = to_arrays(observed)
@@ -100,3 +103,54 @@ def missing_ballot_analysis(observed, m, k, dist):
             "max_replaced": int(replaced.max()),
             "flipping": flipping,
             "win_masks": masks}
+
+def simple_analysis(observed, m, k, draw_ballot):
+    """
+    Compares results from an election with n - 1 ballots and an election with
+    the last ballot drawn at random from statistical culture
+
+    Returns whether or not the single test changed the elected committee
+    """
+    B, w = to_arrays(observed)
+    predicted = stv(B, w, m, k)
+
+    ballot = tuple(int(c) for c in draw_ballot())
+    Bx = np.vstack([B, np.asarray(ballot, dtype=np.int64)])
+    wx = np.append(w, 1.0)
+    win = stv(Bx, wx, m, k)
+
+    return {"predicted": predicted,
+            "ballot": ballot,
+            "winners": win,
+            "changed": win != predicted,
+            "n_replaced": k - bin(win & predicted).count("1")}
+
+def allbutone_analysis(profile, m, k):
+    B, w = to_arrays(profile)
+    n = w.sum()
+    W = stv(B, w, m, k)
+
+    p_wrong = e_replaced = 0.0
+    max_replaced = 0
+    flipping = []
+    for j in range(len(B)):
+        w2 = w.copy()
+        w2[j] -= 1
+        keep = w2 > 0
+        win = stv(B[keep], w2[keep], m, k)
+        replaced = k - bin(win & W).count("1")
+        prob = w[j] / n
+        p_wrong += prob * (replaced > 0)
+        e_replaced += prob * replaced
+        max_replaced = max(max_replaced, replaced)
+        if replaced > 0:
+            flipping.append((tuple(int(x) for x in B[j]), float(prob)))
+
+    return {"winners": [c for c in range(m) if W >> c & 1],
+            "p_wrong": float(p_wrong),
+            "e_replaced": float(e_replaced),
+            "adv_flip": max_replaced > 0,
+            "max_replaced": int(max_replaced),
+            "n_types": len(B),
+            "n_flip_types": len(flipping),
+            "flipping": flipping}
